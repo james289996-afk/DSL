@@ -1,1 +1,97 @@
-Read.me
+Python DSL for chip test by PyVISA
+=================================
+
+这个仓库实现了一个轻量 DSL（领域专用语言），用于通过 SCPI + PyVISA 组织芯片测试实验流程。
+
+文件说明
+--------
+
+- `chiptest_dsl.py`：DSL 解释器 + 执行引擎 + PyVISA/Mock 后端
+- `examples/chip_leakage.dsl`：芯片漏电流测试示例脚本
+
+DSL 语法
+--------
+
+注释：以 `#` 开头。
+
+支持命令：
+
+1. 连接设备
+
+   `CONNECT <alias> "<visa_resource>"`
+
+   示例：
+   `CONNECT dmm "USB0::0x2A8D::0x1301::MY12345678::INSTR"`
+
+2. 下发 SCPI 写命令
+
+   `WRITE <alias> "<scpi_command>"`
+
+   支持变量模板：
+   `WRITE psu "VOLT {vdd}"`
+
+3. 查询并保存结果
+
+   `QUERY <var_name> FROM <alias> "<scpi_query>"`
+
+   示例：
+   `QUERY i_meas FROM dmm "MEAS:CURR:DC?"`
+
+4. 变量赋值（Python 表达式）
+
+   `LET <var> = <expression>`
+
+   示例：
+   `LET avg_i = sum(samples) / len(samples)`
+
+5. 等待
+
+   `WAIT <seconds_expression>`
+
+6. 断言
+
+   `ASSERT <expression> MESSAGE "<text>"`
+
+   `MESSAGE` 可省略：
+   `ASSERT avg_i < 1e-5`
+
+7. 循环
+
+   ```
+   REPEAT <count_expression>
+       ...commands...
+   END
+   ```
+
+   循环中内置变量 `i`（从 0 开始）。
+
+8. 输出
+
+   `PRINT "<text with {vars}>"`
+   或
+   `PRINT <python_expression>`
+
+运行方式
+--------
+
+1. Mock 模式（无仪器，先验证流程）
+
+   `python chiptest_dsl.py examples/chip_leakage.dsl --mock --dump-vars`
+
+2. 真机模式（需要 PyVISA + 驱动）
+
+   `python chiptest_dsl.py examples/chip_leakage.dsl --dump-vars`
+
+依赖建议
+--------
+
+真机模式建议安装：
+
+- `pyvisa`
+- 对应 VISA 后端（如 NI-VISA）或 `pyvisa-py`
+
+注意
+----
+
+- DSL 表达式使用受限的 Python `eval` 环境（仅开放常见数学/类型函数）。
+- `QUERY` 结果默认是字符串，若用于数值计算，请使用 `float(...)` 转换。
