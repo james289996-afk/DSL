@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
+import json
 import math
 import re
 import shlex
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -83,7 +86,50 @@ class Print:
     line_no: int
 
 
-Statement = Connect | Write | Query | Wait | Let | Assert | Repeat | Print
+@dataclass
+class IfElse:
+    condition_expr: str
+    then_body: list["Statement"]
+    else_body: list["Statement"]
+    line_no: int
+
+
+@dataclass
+class Retry:
+    attempts_expr: str
+    delay_expr: str | None
+    body: list["Statement"]
+    line_no: int
+
+
+@dataclass
+class Metric:
+    name: str
+    expr: str
+    line_no: int
+
+
+@dataclass
+class Report:
+    fmt: str
+    path: str
+    line_no: int
+
+
+Statement = (
+    Connect
+    | Write
+    | Query
+    | Wait
+    | Let
+    | Assert
+    | Repeat
+    | Print
+    | IfElse
+    | Retry
+    | Metric
+    | Report
+)
 
 
 # -----------------------------
@@ -105,38 +151,90 @@ def parse_dsl(source: str) -> list[Statement]:
 
     cursor = 0
 
-    def parse_block(expect_end: bool) -> list[Statement]:
+    def parse_block(end_tokens: set[str] | None = None) -> tuple[list[Statement], str | None]:
         nonlocal cursor
+        stop_tokens = end_tokens or set()
         block: list[Statement] = []
 
         while cursor < len(lines):
             line_no, line = lines[cursor]
             upper = line.upper()
 
-            if upper == "END":
-                if not expect_end:
-                    raise DSLParseError(f"Line {line_no}: unexpected END")
+            if upper in stop_tokens:
                 cursor += 1
-                return block
+                return block, upper
+
+            if upper in {"END", "ELSE"}:
+                raise DSLParseError(f"Line {line_no}: unexpected {upper}")
+
+            if upper.startswith("IF "):
+                condition_expr = line[2:].strip()
+                if not condition_expr:
+                    raise DSLParseError(f"Line {line_no}: IF requires condition expression")
+                cursor += 1
+                then_body, terminator = parse_block({"ELSE", "END"})
+                if terminator is None:
+                    raise DSLParseError(f"Line {line_no}: missing END for IF block")
+                if terminator == "ELSE":
+                    else_body, end_terminator = parse_block({"END"})
+                    if end_terminator != "END":
+                        raise DSLParseError(f"Line {line_no}: missing END for IF/ELSE block")
+                else:
+                    else_body = []
+                block.append(
+                    IfElse(
+                        condition_expr=condition_expr,
+                        then_body=then_body,
+                        else_body=else_body,
+                        line_no=line_no,
+                    )
+                )
+                continue
 
             if upper.startswith("REPEAT "):
                 count_expr = line[7:].strip()
                 if not count_expr:
                     raise DSLParseError(f"Line {line_no}: REPEAT requires count expression")
                 cursor += 1
-                body = parse_block(expect_end=True)
+                body, terminator = parse_block({"END"})
+                if terminator != "END":
+                    raise DSLParseError(f"Line {line_no}: missing END for REPEAT block")
                 block.append(Repeat(count_expr=count_expr, body=body, line_no=line_no))
+                continue
+
+            if upper.startswith("RETRY "):
+                match = re.match(
+                    r"^RETRY\s+(.+?)(?:\s+DELAY\s+(.+))?$", line, flags=re.IGNORECASE
+                )
+                if not match:
+                    raise DSLParseError(
+                        f"Line {line_no}: RETRY syntax is RETRY <attempts_expr> [DELAY <seconds_expr>]"
+                    )
+                attempts_expr = match.group(1).strip()
+                delay_expr = match.group(2).strip() if match.group(2) else None
+                if not attempts_expr:
+                    raise DSLParseError(f"Line {line_no}: RETRY requires attempts expression")
+                cursor += 1
+                body, terminator = parse_block({"END"})
+                if terminator != "END":
+                    raise DSLParseError(f"Line {line_no}: missing END for RETRY block")
+                block.append(
+                    Retry(
+                        attempts_expr=attempts_expr,
+                        delay_expr=delay_expr,
+                        body=body,
+                        line_no=line_no,
+                    )
+                )
                 continue
 
             block.append(_parse_statement(line_no, line))
             cursor += 1
 
-        if expect_end:
-            raise DSLParseError("Missing END for REPEAT block")
-        return block
+        return block, None
 
-    parsed = parse_block(expect_end=False)
-    if cursor != len(lines):
+    parsed, terminator = parse_block()
+    if terminator is not None or cursor != len(lines):
         raise DSLParseError("Parser ended unexpectedly")
     return parsed
 
@@ -205,6 +303,23 @@ def _parse_statement(line_no: int, line: str) -> Statement:
             text = _parse_quoted_string(line_no, payload, "PRINT")
             return Print(payload=text, is_expr=False, line_no=line_no)
         return Print(payload=payload, is_expr=True, line_no=line_no)
+
+    if cmd == "METRIC":
+        match = re.match(r"^METRIC\s+([A-Za-z_]\w*)\s*=\s*(.+)$", line, flags=re.IGNORECASE)
+        if not match:
+            raise DSLParseError(f"Line {line_no}: METRIC syntax is METRIC <name> = <expression>")
+        return Metric(name=match.group(1), expr=match.group(2), line_no=line_no)
+
+    if cmd == "REPORT":
+        parts = shlex.split(line)
+        if len(parts) != 3:
+            raise DSLParseError(
+                f"Line {line_no}: REPORT syntax is REPORT <JSON|CSV> \"<output_path>\""
+            )
+        fmt = parts[1].upper()
+        if fmt not in {"JSON", "CSV"}:
+            raise DSLParseError(f"Line {line_no}: REPORT format must be JSON or CSV")
+        return Report(fmt=fmt, path=parts[2], line_no=line_no)
 
     raise DSLParseError(f"Line {line_no}: unknown command '{cmd}'")
 
@@ -310,6 +425,9 @@ class _TemplateDict(dict[str, Any]):
 SAFE_GLOBALS: dict[str, Any] = {
     "__builtins__": {},
     "abs": abs,
+    "bool": bool,
+    "dict": dict,
+    "list": list,
     "min": min,
     "max": max,
     "sum": sum,
@@ -317,6 +435,7 @@ SAFE_GLOBALS: dict[str, Any] = {
     "int": int,
     "float": float,
     "str": str,
+    "tuple": tuple,
     "round": round,
     "math": math,
 }
@@ -327,6 +446,7 @@ class DSLRunner:
         self._adapter = adapter
         self._sessions: dict[str, Any] = {}
         self.variables: dict[str, Any] = {}
+        self.metrics: dict[str, Any] = {}
 
     def run(self, program: list[Statement]) -> None:
         try:
@@ -357,6 +477,14 @@ class DSLRunner:
                 self._exec_print(stmt)
             elif isinstance(stmt, Repeat):
                 self._exec_repeat(stmt)
+            elif isinstance(stmt, IfElse):
+                self._exec_if_else(stmt)
+            elif isinstance(stmt, Retry):
+                self._exec_retry(stmt)
+            elif isinstance(stmt, Metric):
+                self._exec_metric(stmt)
+            elif isinstance(stmt, Report):
+                self._exec_report(stmt)
             else:  # pragma: no cover - unreachable by type
                 raise DSLError(f"Unsupported statement type: {type(stmt)!r}")
 
@@ -411,6 +539,67 @@ class DSLRunner:
             self.variables.pop("i", None)
         else:
             self.variables["i"] = previous_i
+
+    def _exec_if_else(self, stmt: IfElse) -> None:
+        if bool(self._eval_expr(stmt.condition_expr, stmt.line_no)):
+            self._run_block(stmt.then_body)
+        else:
+            self._run_block(stmt.else_body)
+
+    def _exec_retry(self, stmt: Retry) -> None:
+        attempts = int(self._eval_expr(stmt.attempts_expr, stmt.line_no))
+        if attempts <= 0:
+            raise DSLError(f"Line {stmt.line_no}: RETRY attempts must be >= 1")
+        delay = 0.0
+        if stmt.delay_expr is not None:
+            delay = float(self._eval_expr(stmt.delay_expr, stmt.line_no))
+        if delay < 0:
+            raise DSLError(f"Line {stmt.line_no}: RETRY delay cannot be negative")
+
+        last_exc: Exception | None = None
+        for idx in range(attempts):
+            try:
+                self._run_block(stmt.body)
+                self.variables["retry_attempt"] = idx + 1
+                return
+            except Exception as exc:  # noqa: PERF203
+                last_exc = exc
+                self.variables["retry_attempt"] = idx + 1
+                self.variables["last_error"] = str(exc)
+                if idx == attempts - 1:
+                    break
+                if delay > 0:
+                    time.sleep(delay)
+        assert last_exc is not None
+        raise DSLError(
+            f"Line {stmt.line_no}: RETRY failed after {attempts} attempts: {last_exc}"
+        ) from last_exc
+
+    def _exec_metric(self, stmt: Metric) -> None:
+        self.metrics[stmt.name] = self._eval_expr(stmt.expr, stmt.line_no)
+
+    def _exec_report(self, stmt: Report) -> None:
+        raw_path = self._format(stmt.path, stmt.line_no)
+        output_path = Path(raw_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if stmt.fmt == "JSON":
+            payload = {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "metrics": self.metrics,
+                "variables": self.variables,
+            }
+            output_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str),
+                encoding="utf-8",
+            )
+            return
+
+        with output_path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["metric", "value"])
+            for key in sorted(self.metrics):
+                writer.writerow([key, self.metrics[key]])
 
     def _format(self, template: str, line_no: int) -> str:
         try:
