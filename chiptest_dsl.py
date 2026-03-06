@@ -116,6 +116,20 @@ class Report:
     line_no: int
 
 
+@dataclass
+class ForEach:
+    variable: str
+    iterable_expr: str
+    body: list["Statement"]
+    line_no: int
+
+
+@dataclass
+class OnFail:
+    body: list["Statement"]
+    line_no: int
+
+
 Statement = (
     Connect
     | Write
@@ -129,6 +143,8 @@ Statement = (
     | Retry
     | Metric
     | Report
+    | ForEach
+    | OnFail
 )
 
 
@@ -151,7 +167,49 @@ def parse_dsl(source: str) -> list[Statement]:
 
     cursor = 0
 
-    def parse_block(end_tokens: set[str] | None = None) -> tuple[list[Statement], str | None]:
+    def parse_if_chain(
+        if_line_no: int, condition_expr: str, first_branch: bool
+    ) -> IfElse:
+        if not condition_expr:
+            tag = "IF" if first_branch else "ELIF"
+            raise DSLParseError(f"Line {if_line_no}: {tag} requires condition expression")
+
+        then_body, terminator = parse_block(
+            end_tokens={"ELSE", "END"},
+            end_prefixes=("ELIF ",),
+        )
+        if terminator is None:
+            raise DSLParseError(f"Line {if_line_no}: missing END for IF block")
+
+        term_line_no, term_line = terminator
+        term_upper = term_line.upper()
+        if term_upper == "END":
+            else_body: list[Statement] = []
+        elif term_upper == "ELSE":
+            else_body, end_term = parse_block(end_tokens={"END"})
+            if end_term is None:
+                raise DSLParseError(f"Line {if_line_no}: missing END for IF/ELSE block")
+        elif term_upper.startswith("ELIF "):
+            nested = parse_if_chain(
+                term_line_no,
+                term_line[4:].strip(),
+                first_branch=False,
+            )
+            else_body = [nested]
+        else:
+            raise DSLParseError(f"Line {term_line_no}: unexpected terminator '{term_line}'")
+
+        return IfElse(
+            condition_expr=condition_expr,
+            then_body=then_body,
+            else_body=else_body,
+            line_no=if_line_no,
+        )
+
+    def parse_block(
+        end_tokens: set[str] | None = None,
+        end_prefixes: tuple[str, ...] = (),
+    ) -> tuple[list[Statement], tuple[int, str] | None]:
         nonlocal cursor
         stop_tokens = end_tokens or set()
         block: list[Statement] = []
@@ -160,33 +218,21 @@ def parse_dsl(source: str) -> list[Statement]:
             line_no, line = lines[cursor]
             upper = line.upper()
 
-            if upper in stop_tokens:
+            if upper in stop_tokens or any(upper.startswith(prefix) for prefix in end_prefixes):
                 cursor += 1
-                return block, upper
+                return block, (line_no, line)
 
-            if upper in {"END", "ELSE"}:
+            if upper in {"END", "ELSE"} or upper.startswith("ELIF "):
                 raise DSLParseError(f"Line {line_no}: unexpected {upper}")
 
             if upper.startswith("IF "):
-                condition_expr = line[2:].strip()
-                if not condition_expr:
-                    raise DSLParseError(f"Line {line_no}: IF requires condition expression")
                 cursor += 1
-                then_body, terminator = parse_block({"ELSE", "END"})
-                if terminator is None:
-                    raise DSLParseError(f"Line {line_no}: missing END for IF block")
-                if terminator == "ELSE":
-                    else_body, end_terminator = parse_block({"END"})
-                    if end_terminator != "END":
-                        raise DSLParseError(f"Line {line_no}: missing END for IF/ELSE block")
-                else:
-                    else_body = []
+                condition_expr = line[2:].strip()
                 block.append(
-                    IfElse(
+                    parse_if_chain(
+                        if_line_no=line_no,
                         condition_expr=condition_expr,
-                        then_body=then_body,
-                        else_body=else_body,
-                        line_no=line_no,
+                        first_branch=True,
                     )
                 )
                 continue
@@ -197,7 +243,7 @@ def parse_dsl(source: str) -> list[Statement]:
                     raise DSLParseError(f"Line {line_no}: REPEAT requires count expression")
                 cursor += 1
                 body, terminator = parse_block({"END"})
-                if terminator != "END":
+                if terminator is None or terminator[1].upper() != "END":
                     raise DSLParseError(f"Line {line_no}: missing END for REPEAT block")
                 block.append(Repeat(count_expr=count_expr, body=body, line_no=line_no))
                 continue
@@ -216,7 +262,7 @@ def parse_dsl(source: str) -> list[Statement]:
                     raise DSLParseError(f"Line {line_no}: RETRY requires attempts expression")
                 cursor += 1
                 body, terminator = parse_block({"END"})
-                if terminator != "END":
+                if terminator is None or terminator[1].upper() != "END":
                     raise DSLParseError(f"Line {line_no}: missing END for RETRY block")
                 block.append(
                     Retry(
@@ -226,6 +272,40 @@ def parse_dsl(source: str) -> list[Statement]:
                         line_no=line_no,
                     )
                 )
+                continue
+
+            if upper.startswith("FOR "):
+                match = re.match(r"^FOR\s+([A-Za-z_]\w*)\s+IN\s+(.+)$", line, flags=re.IGNORECASE)
+                if not match:
+                    raise DSLParseError(
+                        f"Line {line_no}: FOR syntax is FOR <var> IN <iterable_expression>"
+                    )
+                loop_var = match.group(1)
+                iterable_expr = match.group(2).strip()
+                if not iterable_expr:
+                    raise DSLParseError(
+                        f"Line {line_no}: FOR requires iterable expression after IN"
+                    )
+                cursor += 1
+                body, terminator = parse_block({"END"})
+                if terminator is None or terminator[1].upper() != "END":
+                    raise DSLParseError(f"Line {line_no}: missing END for FOR block")
+                block.append(
+                    ForEach(
+                        variable=loop_var,
+                        iterable_expr=iterable_expr,
+                        body=body,
+                        line_no=line_no,
+                    )
+                )
+                continue
+
+            if upper == "ON_FAIL":
+                cursor += 1
+                body, terminator = parse_block({"END"})
+                if terminator is None or terminator[1].upper() != "END":
+                    raise DSLParseError(f"Line {line_no}: missing END for ON_FAIL block")
+                block.append(OnFail(body=body, line_no=line_no))
                 continue
 
             block.append(_parse_statement(line_no, line))
@@ -447,10 +527,19 @@ class DSLRunner:
         self._sessions: dict[str, Any] = {}
         self.variables: dict[str, Any] = {}
         self.metrics: dict[str, Any] = {}
+        self._on_fail_body: list[Statement] | None = None
 
     def run(self, program: list[Statement]) -> None:
         try:
             self._run_block(program)
+        except Exception as exc:
+            try:
+                self._run_on_fail()
+            except Exception as cleanup_exc:
+                raise DSLError(
+                    f"ON_FAIL handler execution failed. original={exc!s}; handler={cleanup_exc!s}"
+                ) from cleanup_exc
+            raise
         finally:
             for session in self._sessions.values():
                 try:
@@ -485,6 +574,10 @@ class DSLRunner:
                 self._exec_metric(stmt)
             elif isinstance(stmt, Report):
                 self._exec_report(stmt)
+            elif isinstance(stmt, ForEach):
+                self._exec_for_each(stmt)
+            elif isinstance(stmt, OnFail):
+                self._exec_on_fail(stmt)
             else:  # pragma: no cover - unreachable by type
                 raise DSLError(f"Unsupported statement type: {type(stmt)!r}")
 
@@ -600,6 +693,42 @@ class DSLRunner:
             writer.writerow(["metric", "value"])
             for key in sorted(self.metrics):
                 writer.writerow([key, self.metrics[key]])
+
+    def _exec_for_each(self, stmt: ForEach) -> None:
+        iterable = self._eval_expr(stmt.iterable_expr, stmt.line_no)
+        try:
+            iterator = iter(iterable)
+        except TypeError as exc:
+            raise DSLError(
+                f"Line {stmt.line_no}: FOR iterable expression is not iterable"
+            ) from exc
+
+        marker = object()
+        previous_value = self.variables.get(stmt.variable, marker)
+        previous_index = self.variables.get("loop_index", marker)
+        try:
+            for index, item in enumerate(iterator):
+                self.variables[stmt.variable] = item
+                self.variables["loop_index"] = index
+                self._run_block(stmt.body)
+        finally:
+            if previous_value is marker:
+                self.variables.pop(stmt.variable, None)
+            else:
+                self.variables[stmt.variable] = previous_value
+
+            if previous_index is marker:
+                self.variables.pop("loop_index", None)
+            else:
+                self.variables["loop_index"] = previous_index
+
+    def _exec_on_fail(self, stmt: OnFail) -> None:
+        self._on_fail_body = stmt.body
+
+    def _run_on_fail(self) -> None:
+        if self._on_fail_body is None:
+            return
+        self._run_block(self._on_fail_body)
 
     def _format(self, template: str, line_no: int) -> str:
         try:

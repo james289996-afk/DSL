@@ -1,12 +1,17 @@
 # Example: chip leakage test flow
 # Run with mock mode:
-#   python chiptest_dsl.py examples/chip_leakage.dsl --mock --dump-vars
+#   python3 chiptest_dsl.py examples/chip_leakage.dsl --mock --dump-vars
 
 CONNECT psu "TCPIP0::192.168.1.10::inst0::INSTR"
 CONNECT dmm "USB0::0x2A8D::0x1301::MY12345678::INSTR"
 
 WRITE psu "*RST"
 WRITE psu "OUTP OFF"
+
+ON_FAIL
+    PRINT "Test failed, forcing PSU output OFF"
+    WRITE psu "OUTP OFF"
+END
 
 LET vdd = 1.8
 WRITE psu "VOLT {vdd}"
@@ -36,8 +41,10 @@ ASSERT avg_i < 1e-5 MESSAGE "Leakage current too high"
 
 IF avg_i < 1e-6
     LET grade = "A"
-ELSE
+ELIF avg_i < 5e-6
     LET grade = "B"
+ELSE
+    LET grade = "C"
 END
 
 METRIC vdd = vdd

@@ -8,6 +8,8 @@ Python DSL for chip test by PyVISA
 
 - `chiptest_dsl.py`：DSL 解释器 + 执行引擎 + PyVISA/Mock 后端
 - `examples/chip_leakage.dsl`：芯片漏电流测试示例脚本
+- `examples/multi_dut_batch.dsl`：多 DUT 批量冒烟测试示例
+- `examples/on_fail_demo.dsl`：失败回调（ON_FAIL）示例脚本
 
 DSL 语法
 --------
@@ -76,12 +78,14 @@ DSL 语法
    ```
    IF <condition_expression>
        ...commands...
+   ELIF <condition_expression>
+       ...commands...
    ELSE
        ...commands...
    END
    ```
 
-   `ELSE` 可省略。
+   `ELIF` 与 `ELSE` 都可省略。
 
 10. 重试块
 
@@ -112,12 +116,39 @@ DSL 语法
     - JSON 报告包含 `metrics + variables + generated_at`。
     - CSV 报告输出两列：`metric,value`。
 
+13. 列表遍历
+
+    ```
+    FOR <var> IN <iterable_expression>
+        ...commands...
+    END
+    ```
+
+    说明：
+    - 适合批量 DUT 测试。
+    - 循环中内置变量 `loop_index`（从 0 开始）。
+
+14. 失败回调
+
+    ```
+    ON_FAIL
+        ...commands...
+    END
+    ```
+
+    说明：
+    - 当脚本执行出现异常时自动执行，用于安全收尾（如 `WRITE psu "OUTP OFF"`）。
+    - 可在脚本中出现多次，后定义的会覆盖前定义的处理块。
+
 运行方式
 --------
 
 1. Mock 模式（无仪器，先验证流程）
 
    `python3 chiptest_dsl.py examples/chip_leakage.dsl --mock --dump-vars`
+
+   或批量 DUT 示例：
+   `python3 chiptest_dsl.py examples/multi_dut_batch.dsl --mock --dump-vars`
 
 2. 真机模式（需要 PyVISA + 驱动）
 
@@ -137,3 +168,4 @@ DSL 语法
 - DSL 表达式使用受限的 Python `eval` 环境（仅开放常见数学/类型函数）。
 - `QUERY` 结果默认是字符串，若用于数值计算，请使用 `float(...)` 转换。
 - 示例脚本会生成 `reports/chip_leakage.json` 和 `reports/chip_leakage.csv`。
+- 批量示例会生成 `reports/lot_demo_01_summary.json` 和 `reports/lot_demo_01_summary.csv`。
